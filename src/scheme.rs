@@ -1,6 +1,7 @@
 use std::simd::{LaneCount, SupportedLaneCount};
+use std::slice;
 use rand::distributions::{Distribution, Uniform};
-use tiny_keccak::{Hasher, Shake, Xof};
+use tiny_keccak::{Hasher, Xof};
 use crate::{f4, tree, seed_len, hash_len, dim, n, m, tau, Level};
 use crate::shake::{get_shake, get_commit, Domain, Salt, ShakeRng};
 
@@ -11,6 +12,9 @@ type Mq<const L: Level> = f4::Mq<{dim(L)}>;
 type PartyTree<const L: Level> = tree::SeedTree<{n(L)}, {seed_len(L)}>;
 type SetupTree<const L: Level> = tree::SeedTree<{m(L)}, {seed_len(L)}>;
 type CommitTree<const L: Level> = tree::MerkleTree<{m(L)}, {hash_len(L)}>;
+
+#[derive(Debug)]
+pub struct VerifyError;
 
 pub struct PublicKey<const L: Level>(Vector<L>, Seed<L>) where
     LaneCount<{f4::lanes(dim(L))}>: SupportedLaneCount,
@@ -30,14 +34,14 @@ impl<const L: Level> PublicKey<L> where
     [(); 2*n(L)]:,
     [(); 2*m(L)]:,
 {
-    pub fn verify(&self, message: &[u8], signature: &[u8]) -> Result<(), ()> {
+    pub fn verify(&self, message: &[u8], signature: &[u8]) -> Result<(), VerifyError> {
         let mq = Mq::<L>::expand::<L>(&self.1);
         let mut shake = get_shake::<L>();
         shake.update(self.0.buf());
         shake.update(message);
         let salt = Salt::new(&shake);
         let (commit, witness) = signature.split_at(hash_len(L));
-        let challenge = self.challenge(&commit, salt);
+        let challenge = self.challenge(commit, salt);
         let (seeds, witness) = SetupTree::<L>::restore(
             &challenge.0,
             witness,
@@ -86,10 +90,10 @@ impl<const L: Level> PublicKey<L> where
             salt.with_domain::<{Domain::CommitTree}>());
         transcript.update(root);
         let new_commit = get_commit::<{hash_len(L)}>(transcript);
-        if commit == new_commit && witness.len() == 0 {
+        if commit == new_commit && witness.is_empty() {
             Ok(())
         } else {
-            Err(())
+            Err(VerifyError)
         }
     }
 
@@ -109,8 +113,8 @@ impl<const L: Level> PublicKey<L> where
     fn verify_setup(&self, mq: &Mq<L>, seed: &[u8], salt: Salt) -> [Hash<L>; n(L)] {
         let (seeds, shares, mask, mut aux) = self.setup(seed, salt);
         let mut correction = mq.apply(&mask);
-        for i in 0..(n(L) - 1) {
-            correction ^= shares[i][1];
+        for share in shares.iter().take(n(L) - 1) {
+            correction ^= share[1];
         }
         aux[n(L) - 1] = self.commit_final(&seeds[n(L) - 1], &correction, salt);
         aux
@@ -131,8 +135,8 @@ impl<const L: Level> PublicKey<L> where
             msgs[hidden] ^= msgs[i];
         }
         let mut shake = salt.with_domain::<{Domain::SimulateCommit}>().shake();
-        for i in 0..n(L) {
-            shake.update(msgs[i].buf());
+        for msg in msgs.iter() {
+            shake.update(msg.buf());
         }
         get_commit(shake)
     }
@@ -143,8 +147,8 @@ impl<const L: Level> PublicKey<L> where
         let seeds = PartyTree::<L>::new(seed, salt.with_domain::<{Domain::PartyTree}>());
         let (shares, aux) = self.expand_seeds(&seeds, usize::MAX, salt);
         let mut mask = Vector::<L>::zero();
-        for i in 0..n(L) {
-            mask ^= shares[i][0];
+        for share in shares.iter() {
+            mask ^= share[0];
         }
         (seeds, shares, mask, aux)
     }
@@ -248,16 +252,13 @@ impl<const L: Level> SecretKey<L> where
         let mut signature: Vec<u8> = Vec::new();
         signature.extend_from_slice(&commit);
         signature.extend_from_slice(&seeds.conceal(&challenge.0));
-        for i in 0..m(L) {
-            let hidden = challenge.1[i];
-            if hidden < n(L) {
-                let (seeds, aux, masked, correction) = &setups[i];
-                signature.extend_from_slice(&seeds.conceal(&challenge.1[i..i+1]));
-                signature.extend_from_slice(&aux[hidden]);
-                signature.extend_from_slice(masked.buf());
-                if hidden != n(L) - 1 {
-                    signature.extend_from_slice(correction.buf());
-                }
+        for (i, &hidden) in challenge.1.iter().enumerate().filter(|(_, &h)| h < n(L)) {
+            let (seeds, aux, masked, correction) = &setups[i];
+            signature.extend_from_slice(&seeds.conceal(slice::from_ref(&hidden)));
+            signature.extend_from_slice(&aux[hidden]);
+            signature.extend_from_slice(masked.buf());
+            if hidden != n(L) - 1 {
+                signature.extend_from_slice(correction.buf());
             }
         }
         signature.extend_from_slice(&coms.reveal(&challenge.0));
@@ -269,7 +270,7 @@ impl<const L: Level> SecretKey<L> where
     ) -> (Hash<L>, (PartyTree<L>, [Hash<L>; n(L)], Vector<L>, Vector<L>)) {
         let (seeds, shares, mask, mut aux) = self.2.setup(seed, salt);
         let masked = self.0 ^ mask;
-        let (com, correction) = self.execute(&mq, &masked, shares, salt);
+        let (com, correction) = self.execute(mq, &masked, shares, salt);
         aux[n(L) - 1] = self.2.commit_final(&seeds[n(L) - 1], &correction, salt);
         (com, (seeds, aux, masked, correction))
     }
@@ -277,11 +278,11 @@ impl<const L: Level> SecretKey<L> where
     fn execute(
         &self, mq: &Mq<L>, masked: &Vector<L>, shares: [[Vector<L>; 2]; n(L)], salt: Salt
     ) -> (Hash<L>, Vector<L>) {
-        let (out, polar) = mq.apply_and_polar(&masked);
+        let (out, polar) = mq.apply_and_polar(masked);
         let mut correction = self.2.0 ^ out;
         let mut shake = salt.with_domain::<{Domain::SimulateCommit}>().shake();
-        for i in 0..(n(L) - 1) {
-            let msg = polar.apply(&shares[i][0]) ^ shares[i][1];
+        for share in shares.iter().take(n(L) - 1) {
+            let msg = polar.apply(&share[0]) ^ share[1];
             shake.update(msg.buf());
             correction ^= msg;
         }
@@ -297,8 +298,9 @@ mod tests {
     use test::{black_box, Bencher};
 
     use average::Variance;
+    use tiny_keccak::{Hasher, Shake, Xof};
     use crate::Level;
-    use super::*;
+    use super::SecretKey;
 
     #[test]
     fn test_l1() {

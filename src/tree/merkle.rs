@@ -66,7 +66,7 @@ impl<const N: usize, const M: usize> Index<usize> for MerkleTree<N, M> where
     type Output = [u8];
 
     fn index(&self, idx: usize) -> &Self::Output {
-        return &self.nodes[N + idx];
+        &self.nodes[N + idx]
     }
 }
 
@@ -74,7 +74,7 @@ impl<const N: usize, const M: usize> IndexMut<usize> for MerkleTree<N, M> where
     [(); 2*N]:,
 {
     fn index_mut(&mut self, idx: usize) -> &mut Self::Output {
-        return &mut self.nodes[N + idx];
+        &mut self.nodes[N + idx]
     }
 }
 

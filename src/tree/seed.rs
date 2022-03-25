@@ -65,7 +65,7 @@ impl<const N: usize, const M: usize> Index<usize> for SeedTree<N, M> where
     type Output = [u8];
 
     fn index(&self, idx: usize) -> &Self::Output {
-        return &self.nodes[N + idx];
+        &self.nodes[N + idx]
     }
 }
 
